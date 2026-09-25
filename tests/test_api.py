@@ -3,6 +3,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.main import (
+    green_wave_conflict_audit,
     green_wave_convoy_starts,
     green_wave_earliest_route,
     green_wave_max_coverage,
@@ -14,6 +15,7 @@ from app.main import (
     green_wave_windows,
 )
 from app.schemas import (
+    ConflictAuditRequest,
     ConvoyStartsRequest,
     EarliestRouteRequest,
     GreenWaveRequest,
@@ -1411,3 +1413,225 @@ def test_min_discharge_route_is_in_openapi():
     ref = response["content"]["application/json"]["schema"]
     assert {"type": "null"} in ref["anyOf"]
     assert any("$ref" in item for item in ref["anyOf"])
+
+
+# ---------- POST /api/green-wave/conflict-audit ----------
+
+
+def make_conflict_audit_request(payload):
+    return ConflictAuditRequest.model_validate(payload)
+
+
+def conflict_payload(**kw):
+    base = {
+        "audit_from": 0,
+        "audit_to": 120,
+        "streams": [
+            {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+            {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 50},
+        ],
+        "pairs": [{"a": 0, "b": 1, "clearance": 5}],
+    }
+    base.update(kw)
+    return base
+
+
+def test_conflict_audit_payload_overlap_and_tail():
+    # A=[0,30)、B=[20,50)、c=5：重叠 [20,30) 加 A 尾部 [30,35) 合并为 [20,35)
+    req = make_conflict_audit_request(conflict_payload())
+    resp = green_wave_conflict_audit(req)
+    assert resp.audit_from == 0
+    assert resp.audit_to == 120
+    assert len(resp.pairs) == 1
+    pair = resp.pairs[0]
+    assert pair.a == 0
+    assert pair.b == 1
+    assert pair.clearance == 5
+    assert [[w.start, w.end] for w in pair.danger_intervals] == [
+        [20, 35], [80, 95],
+    ]
+
+
+def test_conflict_audit_safe_pair_returns_empty_intervals():
+    # 首尾相接、c=0：无同时绿灯，安全
+    payload = conflict_payload(
+        streams=[
+            {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+            {"cycle": 60, "offset": 0, "green_start": 30, "green_end": 50},
+        ],
+        pairs=[{"a": 0, "b": 1, "clearance": 0}],
+    )
+    resp = green_wave_conflict_audit(make_conflict_audit_request(payload))
+    assert resp.pairs[0].danger_intervals == []
+
+
+def test_conflict_audit_green_before_range_contributes_tail():
+    # 范围从 32 开始：范围前结束的 A 绿灯尾部仍裁剪进 [32,40)
+    payload = conflict_payload(
+        audit_from=32,
+        streams=[
+            {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+            {"cycle": 60, "offset": 0, "green_start": 30, "green_end": 50},
+        ],
+        pairs=[{"a": 0, "b": 1, "clearance": 10}],
+    )
+    resp = green_wave_conflict_audit(make_conflict_audit_request(payload))
+    assert [[w.start, w.end] for w in resp.pairs[0].danger_intervals] == [
+        [32, 40], [90, 100],
+    ]
+
+
+def test_conflict_audit_multiple_pairs_input_order():
+    payload = conflict_payload(
+        streams=[
+            {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+            {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 50},
+            {"cycle": 60, "offset": 0, "green_start": 40, "green_end": 55},
+        ],
+        pairs=[
+            {"a": 2, "b": 0, "clearance": 0},
+            {"a": 0, "b": 1, "clearance": 5},
+        ],
+    )
+    resp = green_wave_conflict_audit(make_conflict_audit_request(payload))
+    assert [(p.a, p.b) for p in resp.pairs] == [(2, 0), (0, 1)]
+    # 第一对：A=[0,30) 与 C=[40,55) c=0 从不重叠
+    assert resp.pairs[0].danger_intervals == []
+    assert [[w.start, w.end] for w in resp.pairs[1].danger_intervals] == [
+        [20, 35], [80, 95],
+    ]
+
+
+def test_conflict_audit_empty_pairs_accepted():
+    payload = conflict_payload(pairs=[])
+    resp = green_wave_conflict_audit(make_conflict_audit_request(payload))
+    assert resp.pairs == []
+
+
+def test_conflict_audit_rejects_stream_count_out_of_range():
+    with pytest.raises(ValidationError):
+        make_conflict_audit_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30}
+                ]
+            )
+        )
+    with pytest.raises(ValidationError):
+        make_conflict_audit_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30}
+                    for _ in range(9)
+                ],
+                pairs=[],
+            )
+        )
+
+
+def test_conflict_audit_rejects_clearance_out_of_range():
+    with pytest.raises(ValidationError):
+        make_conflict_audit_request(
+            conflict_payload(pairs=[{"a": 0, "b": 1, "clearance": -1}])
+        )
+    with pytest.raises(ValidationError):
+        make_conflict_audit_request(
+            conflict_payload(pairs=[{"a": 0, "b": 1, "clearance": 301}])
+        )
+
+
+def test_conflict_audit_rejects_phase_out_of_range():
+    # offset / green_start / green_end 必须落在 [0, cycle) 内（第二股车流）
+    for field, value in (("offset", 60), ("green_start", 60), ("green_end", 60)):
+        req = make_conflict_audit_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+                    {"cycle": 60, "offset": 0, "green_start": 20,
+                     "green_end": 50, **({field: value})},
+                ]
+            )
+        )
+        with pytest.raises(HTTPException) as exc:
+            green_wave_conflict_audit(req)
+        assert exc.value.status_code == 422
+    with pytest.raises(ValidationError):
+        make_conflict_audit_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 0, "offset": 0, "green_start": 0, "green_end": 0},
+                    {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 50},
+                ]
+            )
+        )
+
+
+def test_conflict_audit_rejects_bad_range():
+    # 空范围与超长范围均 422
+    req = make_conflict_audit_request(
+        conflict_payload(audit_from=10, audit_to=10)
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+    req = make_conflict_audit_request(
+        conflict_payload(audit_from=0, audit_to=86401)
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+
+
+def test_conflict_audit_rejects_pair_index_out_of_range():
+    req = make_conflict_audit_request(
+        conflict_payload(pairs=[{"a": 0, "b": 2, "clearance": 5}])
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+
+
+def test_conflict_audit_rejects_same_stream_pair():
+    req = make_conflict_audit_request(
+        conflict_payload(pairs=[{"a": 1, "b": 1, "clearance": 5}])
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+
+
+def test_conflict_audit_rejects_duplicate_pair():
+    # (0,1) 与 (1,0) 是同一个无序对
+    req = make_conflict_audit_request(
+        conflict_payload(
+            pairs=[
+                {"a": 0, "b": 1, "clearance": 5},
+                {"a": 1, "b": 0, "clearance": 3},
+            ]
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+
+
+def test_conflict_audit_accepts_full_day_range_boundary():
+    payload = conflict_payload(
+        audit_from=0,
+        audit_to=86400,
+        pairs=[{"a": 0, "b": 1, "clearance": 300}],
+    )
+    req = make_conflict_audit_request(payload)
+    req.validate_ranges()
+    resp = green_wave_conflict_audit(req)
+    # 周期 60：每个周期危险 [20,35)，全天 86400/60=1440 段
+    assert len(resp.pairs[0].danger_intervals) == 1440
+
+
+def test_conflict_audit_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    path = "/api/green-wave/conflict-audit"
+    assert path in paths
+    assert "post" in paths[path]

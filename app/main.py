@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .greenwave import (
+    compute_conflict_audit,
     compute_convoy_starts,
     compute_earliest_route,
     compute_max_coverage,
@@ -17,6 +18,9 @@ from .greenwave import (
     offset_diagnostics,
 )
 from .schemas import (
+    ConflictAuditRequest,
+    ConflictAuditResponse,
+    ConflictPairResult,
     ConvoyStartsRequest,
     EarliestRouteRequest,
     EarliestRouteResponse,
@@ -102,9 +106,17 @@ app = FastAPI(
         "放行，跨零点与常绿判灯规则不变）与对放行量的单调二分，求使期初"
         "车辆及全部批次在范围结束前清空、且每批最后一辆不晚于自身 deadline"
         "的最小正整数每绿灯秒放行量；同秒批次按输入顺序先入队再放行。返回"
-        "最低放行量及该值下按输入顺序的各批通过秒，无解返回 null。"
+        "最低放行量及该值下按输入顺序的各批通过秒，无解返回 null。\n\n"
+        "冲突车流安全间隔审计接口 `POST /api/green-wave/conflict-audit`："
+        "给定 2..8 股车流各自的周期、offset 与绿灯半开区间（跨零点、常绿"
+        "语义同上）、最长 86400 秒的半开审计范围，以及 0..28 个互斥车流对"
+        "（两个车流下标与该对 0..300 秒的清空间隔）。对每对车流，两股同时"
+        "绿灯，或一股仍为绿灯而另一股绿灯结束尚不足清空间隔时判为危险；按"
+        "周期展开绿灯区间、双向延长尾部后求交（计入范围起点之前开始的绿灯"
+        "与跨零点区间，两股都已红灯的尾部交叠不计），逐对返回按时间升序"
+        "合并的全部极大半开危险区间，安全的车流对返回空数组。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -395,4 +407,45 @@ def green_wave_min_discharge(
     return MinDischargeResponse(
         min_discharge_per_second=discharge,
         batch_pass_times=pass_times,
+    )
+
+
+@app.post(
+    "/api/green-wave/conflict-audit",
+    response_model=ConflictAuditResponse,
+    tags=["绿波"],
+    summary="冲突车流安全间隔审计：逐互斥对求全部极大半开危险区间",
+)
+def green_wave_conflict_audit(
+    request: ConflictAuditRequest,
+) -> ConflictAuditResponse:
+    request.validate_ranges()
+    results = compute_conflict_audit(
+        streams=[
+            {
+                "cycle": item.cycle,
+                "offset": item.offset,
+                "green_start": item.green_start,
+                "green_end": item.green_end,
+            }
+            for item in request.streams
+        ],
+        audit_from=request.audit_from,
+        audit_to=request.audit_to,
+        pairs=[(pair.a, pair.b, pair.clearance) for pair in request.pairs],
+    )
+    return ConflictAuditResponse(
+        audit_from=request.audit_from,
+        audit_to=request.audit_to,
+        pairs=[
+            ConflictPairResult(
+                a=pair.a,
+                b=pair.b,
+                clearance=pair.clearance,
+                danger_intervals=[
+                    Window(start=start, end=end) for start, end in intervals
+                ],
+            )
+            for pair, intervals in zip(request.pairs, results)
+        ],
     )

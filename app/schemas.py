@@ -7,6 +7,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .greenwave import (
     MAX_ARRIVAL_BATCHES,
+    MAX_CONFLICT_AUDIT_SECONDS,
+    MAX_CONFLICT_CLEARANCE,
+    MAX_CONFLICT_PAIRS,
+    MAX_CONFLICT_STREAMS,
     MAX_CONVOY_VEHICLES,
     MAX_CYCLE,
     MAX_INTERSECTIONS,
@@ -744,4 +748,147 @@ class MinDischargeResponse(BaseModel):
             "取最小放行量时各批最后一辆车的通过秒（整数秒，与 arrivals 一一对应、"
             "按输入顺序）；每批通过秒均不晚于其 deadline 且严格小于 forecast_to"
         ),
+    )
+
+
+# ---------- 冲突车流安全间隔审计 ----------
+
+
+class ConflictStream(BaseModel):
+    """单股冲突车流的信号参数（整数秒），不含行驶时间。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = Field(
+        default=None, max_length=64, description="可选的车流名称，仅用于辨识"
+    )
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="信号周期 C（秒），1..86400"
+    )
+    offset: int = Field(..., ge=0, description="相位偏移 o（秒），需满足 0 <= o < C")
+    green_start: int = Field(
+        ..., ge=0, description="绿灯起点（本地相位秒），需满足 0 <= g_start < C"
+    )
+    green_end: int = Field(
+        ..., ge=0, description="绿灯终点（本地相位秒，不含），需满足 0 <= g_end < C"
+    )
+
+    def validate_against_cycle(self, index: int) -> list[str]:
+        """校验相位与绿灯端点；返回中文错误信息列表（空列表表示合法）。"""
+        errors: list[str] = []
+        label = self.name or f"下标 {index}"
+        if not 0 <= self.offset < self.cycle:
+            errors.append(f"offset 必须满足 0 <= offset < cycle（车流 {label}）")
+        if not 0 <= self.green_start < self.cycle:
+            errors.append(
+                f"green_start 必须满足 0 <= green_start < cycle（车流 {label}）"
+            )
+        if not 0 <= self.green_end < self.cycle:
+            errors.append(
+                f"green_end 必须满足 0 <= green_end < cycle（车流 {label}）"
+            )
+        return errors
+
+
+class ConflictPair(BaseModel):
+    """一对互斥车流及其专用的清空间隔。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    a: int = Field(..., ge=0, description="第一股车流下标（从 0 起），须小于车流数")
+    b: int = Field(..., ge=0, description="第二股车流下标（从 0 起），须小于车流数")
+    clearance: int = Field(
+        ..., ge=0, le=MAX_CONFLICT_CLEARANCE,
+        description="该对两股共用的清空间隔 c（秒），0..300；任一股绿灯结束后不足 c 秒内另一股出现绿灯即危险",
+    )
+
+
+class ConflictAuditRequest(BaseModel):
+    """冲突车流安全间隔审计请求。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    audit_from: int = Field(..., ge=0, description="审计范围起点（秒，含）")
+    audit_to: int = Field(
+        ..., ge=1, description="审计范围终点（秒，不含）；范围长度 1..86400"
+    )
+    streams: list[ConflictStream] = Field(
+        ..., min_length=2, max_length=MAX_CONFLICT_STREAMS,
+        description="冲突车流列表，2..8 股，按下标编号（0 起）",
+    )
+    pairs: list[ConflictPair] = Field(
+        ..., max_length=MAX_CONFLICT_PAIRS,
+        description=(
+            "互斥车流对列表，0..28 对（至多 8 股时的全部两两组合）；每对给出 "
+            "a、b 两个车流下标与该对 0..300 秒的清空间隔；按输入顺序逐对返回"
+        ),
+    )
+
+    def validate_ranges(self) -> None:
+        """跨字段校验：范围长度、各车流相位上界、车流对下标与重复对；非法抛 422。"""
+        errors: list[str] = []
+        length = self.audit_to - self.audit_from
+        if length <= 0:
+            errors.append("audit_to 必须大于 audit_from（半开审计范围）")
+        elif length > MAX_CONFLICT_AUDIT_SECONDS:
+            errors.append("审计范围长度不得超过 86400 秒")
+
+        for index, stream in enumerate(self.streams):
+            errors.extend(stream.validate_against_cycle(index))
+
+        count = len(self.streams)
+        seen: set[tuple[int, int]] = set()
+        for index, pair in enumerate(self.pairs):
+            if pair.a >= count:
+                errors.append(
+                    f"pairs[{index}].a = {pair.a} 必须满足 0 <= a < 车流数"
+                    f"（当前 {count} 股）"
+                )
+            if pair.b >= count:
+                errors.append(
+                    f"pairs[{index}].b = {pair.b} 必须满足 0 <= b < 车流数"
+                    f"（当前 {count} 股）"
+                )
+            if pair.a == pair.b:
+                errors.append(
+                    f"pairs[{index}] 的两股车流下标不能相同（a = b = {pair.a}）"
+                )
+                continue
+            key = (min(pair.a, pair.b), max(pair.a, pair.b))
+            if key in seen:
+                errors.append(
+                    f"pairs[{index}] 重复的互斥车流对（车流 {key[0]} 与 {key[1]}）"
+                )
+            else:
+                seen.add(key)
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class ConflictPairResult(BaseModel):
+    """单个互斥车流对的审计结果：回显下标、清空间隔与全部极大危险区间。"""
+
+    a: int = Field(..., ge=0, description="请求中该对的第一股车流下标")
+    b: int = Field(..., ge=0, description="请求中该对的第二股车流下标")
+    clearance: int = Field(
+        ..., ge=0, description="请求中该对的清空间隔（秒）"
+    )
+    danger_intervals: list[Window] = Field(
+        ...,
+        description=(
+            "两股同时绿灯、或一股绿灯而另一股绿灯结束尚不足清空间隔的全部极大"
+            "半开危险区间 [start,end)，按起点升序并已合并相接区间；安全的车流"
+            "对为空数组 []"
+        ),
+    )
+
+
+class ConflictAuditResponse(BaseModel):
+    """冲突车流安全间隔审计结果：回显审计范围，逐对给出极大危险区间。"""
+
+    audit_from: int = Field(..., ge=0, description="回显审计范围起点（秒，含）")
+    audit_to: int = Field(..., ge=1, description="回显审计范围终点（秒，不含）")
+    pairs: list[ConflictPairResult] = Field(
+        ...,
+        description="与请求 pairs 同序的逐对审计结果；空互斥对列表时为空数组",
     )
