@@ -3,6 +3,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.main import (
+    green_wave_conflict_audit,
     green_wave_convoy_starts,
     green_wave_earliest_route,
     green_wave_max_coverage,
@@ -14,6 +15,7 @@ from app.main import (
     green_wave_windows,
 )
 from app.schemas import (
+    ConflictAuditRequest,
     ConvoyStartsRequest,
     EarliestRouteRequest,
     GreenWaveRequest,
@@ -1411,3 +1413,182 @@ def test_min_discharge_route_is_in_openapi():
     ref = response["content"]["application/json"]["schema"]
     assert {"type": "null"} in ref["anyOf"]
     assert any("$ref" in item for item in ref["anyOf"])
+
+
+# ---------- POST /api/green-wave/conflict-audit ----------
+
+
+def make_conflict_request(payload):
+    return ConflictAuditRequest.model_validate(payload)
+
+
+def conflict_payload(**kw):
+    base = {
+        "audit_from": 0,
+        "audit_to": 120,
+        "streams": [
+            {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+            {"cycle": 60, "offset": 0, "green_start": 30, "green_end": 0},
+        ],
+        "pairs": [{"first": 0, "second": 1, "clearance": 5}],
+    }
+    base.update(kw)
+    return base
+
+
+def test_conflict_audit_payload_danger_and_safe_pairs():
+    # 首尾相接的两股绿灯：d=5 时 [0,5) 与 [30,35) 每周期危险
+    req = make_conflict_request(conflict_payload())
+    resp = green_wave_conflict_audit(req)
+    assert len(resp) == 1
+    assert resp[0].first == 0
+    assert resp[0].second == 1
+    assert resp[0].clearance == 5
+    assert [[w.start, w.end] for w in resp[0].danger_intervals] == [
+        [0, 5], [30, 35], [60, 65], [90, 95],
+    ]
+
+    # d=0 时端点相接不重叠：安全对返回空数组
+    req = make_conflict_request(
+        conflict_payload(pairs=[{"first": 0, "second": 1, "clearance": 0}])
+    )
+    resp = green_wave_conflict_audit(req)
+    assert resp[0].danger_intervals == []
+
+
+def test_conflict_audit_normalizes_pair_order():
+    # 输入 (1, 0) 时输出统一规范化为 first < second
+    req = make_conflict_request(
+        conflict_payload(pairs=[{"first": 1, "second": 0, "clearance": 5}])
+    )
+    resp = green_wave_conflict_audit(req)
+    assert resp[0].first == 0
+    assert resp[0].second == 1
+
+
+def test_conflict_audit_empty_pairs_returns_empty_array():
+    req = make_conflict_request(conflict_payload(pairs=[]))
+    assert green_wave_conflict_audit(req) == []
+
+
+def test_conflict_audit_range_boundaries():
+    # 恰 86400 秒合法
+    req = make_conflict_request(
+        conflict_payload(audit_from=0, audit_to=86400)
+    )
+    req.validate_ranges()
+    # 超长范围 422
+    req = make_conflict_request(
+        conflict_payload(audit_from=0, audit_to=86401)
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+    # 空范围 422
+    req = make_conflict_request(
+        conflict_payload(audit_from=100, audit_to=100)
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+
+
+def test_conflict_audit_rejects_invalid_pairs():
+    # 自对（first == second）422
+    req = make_conflict_request(
+        conflict_payload(
+            pairs=[{"first": 0, "second": 0, "clearance": 0}]
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+    # 下标越界 422
+    req = make_conflict_request(
+        conflict_payload(
+            pairs=[{"first": 0, "second": 2, "clearance": 0}]
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+    # 重复对（顺序相反也算重复）422
+    req = make_conflict_request(
+        conflict_payload(
+            pairs=[
+                {"first": 0, "second": 1, "clearance": 0},
+                {"first": 1, "second": 0, "clearance": 3},
+            ]
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_conflict_audit(req)
+    assert exc.value.status_code == 422
+
+
+def test_conflict_audit_reuses_signal_validation():
+    # offset / green_start / green_end 必须落在 [0, cycle) 内
+    for field, value in (("offset", 60), ("green_start", 60), ("green_end", 60)):
+        streams = [
+            {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30},
+            {"cycle": 60, "offset": 0, "green_start": 30, "green_end": 0},
+        ]
+        streams[0] = {**streams[0], field: value}
+        req = make_conflict_request(conflict_payload(streams=streams))
+        with pytest.raises(HTTPException) as exc:
+            green_wave_conflict_audit(req)
+        assert exc.value.status_code == 422
+
+
+def test_conflict_audit_field_level_validation():
+    # clearance 必须在 0..300
+    with pytest.raises(ValidationError):
+        make_conflict_request(
+            conflict_payload(
+                pairs=[{"first": 0, "second": 1, "clearance": 301}]
+            )
+        )
+    with pytest.raises(ValidationError):
+        make_conflict_request(
+            conflict_payload(
+                pairs=[{"first": 0, "second": 1, "clearance": -1}]
+            )
+        )
+    # 车流数必须在 2..8
+    with pytest.raises(ValidationError):
+        make_conflict_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 60, "offset": 0,
+                     "green_start": 0, "green_end": 30}
+                ]
+            )
+        )
+    with pytest.raises(ValidationError):
+        make_conflict_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30}
+                    for _ in range(9)
+                ]
+            )
+        )
+    # cycle 必须在 1..86400
+    with pytest.raises(ValidationError):
+        make_conflict_request(
+            conflict_payload(
+                streams=[
+                    {"cycle": 0, "offset": 0, "green_start": 0, "green_end": 0},
+                    {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 0},
+                ]
+            )
+        )
+
+
+def test_conflict_audit_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    path = "/api/green-wave/conflict-audit"
+    assert path in paths
+    assert "post" in paths[path]

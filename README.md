@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供十个接口：
+提供十一个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -78,6 +78,15 @@
     最后一辆不晚于自身 `deadline` 通过的**最小正整数**每绿灯秒放行量，返回该最低放行量
     及此值下按输入顺序的各批通过秒；同秒批次按输入顺序先入队再放行；无解（绿灯秒
     不足、deadline 无法满足等）时响应体为 `null`。
+11. **冲突车流安全间隔审计** `POST /api/green-wave/conflict-audit`：给定 **2～8 股**
+    车流的周期、offset 与绿灯半开区间（相位、跨零点与常绿语义与其余接口完全一致）、
+    最长 **86400 秒**的整数秒**半开**审计范围 `[audit_from, audit_to)`，以及若干
+    **互斥车流对**（按下标引用）与各对 **0～300 秒**的清空间隔 `clearance`。对每对
+    车流，**两股同时绿灯**，或**一股仍为绿灯而另一股绿灯结束尚不足清空间隔**时，
+    均判为危险（两股都已变红、仅清空时段重叠不算危险）。服务按周期展开绿灯区间
+    （计入**审计范围起点之前**结束、尾部伸入范围的绿灯与**跨零点**区间），**双向
+    延长尾部后求交**，逐对返回按时间升序并合并的**全部极大半开危险区间**；安全的
+    车流对返回空数组 `[]`。
 
 ## 目录结构
 
@@ -146,6 +155,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 最早到达路径 | `POST http://localhost:8000/api/green-wave/earliest-route` |
 | 单路口排队预测 | `POST http://localhost:8000/api/green-wave/queue-forecast` |
 | 路口放行能力测算 | `POST http://localhost:8000/api/green-wave/min-discharge` |
+| 冲突车流安全间隔审计 | `POST http://localhost:8000/api/green-wave/conflict-audit` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -1424,6 +1434,153 @@ curl -s -X POST http://localhost:8000/api/green-wave/min-discharge \
    总数大小无关）；全天范围、1000 批次的请求在毫秒级完成。测试含 3000 组随机参数下
    与**逐辆展开 + 逐放行量扫描**暴力参考实现（最低放行量与各批通过秒）的逐项对照。
 
+## 冲突车流安全间隔审计
+
+`POST /api/green-wave/conflict-audit` 用于检查冲突（互斥）车流在给定时间范围内是否
+存在安全间隔不足：若两股车流在同一时刻都被放行，或一股仍在绿灯而另一股绿灯刚结束、
+冲突点尚未清空，即为危险。每股车流的信号参数（`cycle`、`offset`、
+`green_start`、`green_end`）与相位约定（`(t+offset) mod cycle`、绿灯半开区间、
+跨周期零点、`green_start == green_end` 为整周期常绿）和其余接口**完全一致**，但
+车流不含行驶时间参数。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `audit_from` | int | `>= 0`，审计范围起点（秒，含） |
+| `audit_to` | int | `> audit_from`，且 `audit_to - audit_from <= 86400` |
+| `streams` | array | **2..8** 股车流，按下标编号（0 起） |
+| `streams[].name` | string? | 可选名称，仅用于辨识 |
+| `streams[].cycle` | int | `1..86400`，信号周期 C（秒） |
+| `streams[].offset` | int | `0 <= offset < cycle`，相位偏移 |
+| `streams[].green_start` | int | `0 <= green_start < cycle`，绿灯起点（本地相位秒） |
+| `streams[].green_end` | int | `0 <= green_end < cycle`，绿灯终点（不含）；与 `green_start` 相等表示整周期常绿 |
+| `pairs` | array | **0..28** 对互斥车流（8 股的全部两两组合数）；同一对不得重复 |
+| `pairs[].first` | int | 第一股车流下标，`0 <= first < 车流数` |
+| `pairs[].second` | int | 第二股车流下标，`0 <= second < 车流数`，且不等于 `first` |
+| `pairs[].clearance` | int | 该对清空间隔（秒），**`0..300`** |
+
+危险判定（对车流对 *i*、*j* 与清空间隔 d，任一成立即危险）：
+
+1. 两股车流在时刻 t **同时绿灯**；
+2. i 在 t 仍为绿灯，而 j 的绿灯在 t 之前**不足 d 秒**结束（j 方向冲突点尚在清空）；
+3. j 在 t 仍为绿灯，而 i 的绿灯结束不足 d 秒（对称情形）。
+
+注意：**两股都已不是绿灯时不危险**——即使两者的清空尾部相互重叠，也没有任何一股
+车流正在进入冲突点。"绿灯结束恰为 d 秒前"也不危险（要求的是**不足** d 秒）。
+
+成功响应为与 `pairs` 同序的数组，每项回显**按下标升序规范化**后的车流对、清空间隔
+与该对的全部危险区间：
+
+```json
+{
+  "first": 0,
+  "second": 1,
+  "clearance": 5,
+  "danger_intervals": [{"start": 0, "end": 5}, {"start": 30, "end": 35}]
+}
+```
+
+- `first` / `second`：规范化为 `first < second`，与输入中两股的先后方向无关；
+- `danger_intervals`：审计范围内的全部**极大半开**危险区间 `[start, end)`，按起点
+  升序并已合并重叠 / 端点相接段；安全的车流对为空数组 `[]`。`pairs` 本身为空时
+  响应也是 `[]`。
+
+### 示例 1：绿灯首尾相接，清空间隔产生危险尾部
+
+两股周期 60 秒的车流绿灯各占半周期：车流 0 为本地相位 `[0,30)`，车流 1 为
+`[30,60)`（用跨零点写法 `green_start=30, green_end=0` 表示），清空间隔 5 秒。
+`t∈[0,5)` 时车流 0 仍绿，而车流 1 上一周期绿灯恰在 t=0 结束、结束不足 5 秒；
+`t∈[30,35)` 为对称情形。两股从不同时绿灯，但清空间隔仍被破坏：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "audit_from": 0,
+    "audit_to": 120,
+    "streams": [
+      {"cycle": 60, "offset": 0, "green_start": 0,  "green_end": 30},
+      {"cycle": 60, "offset": 0, "green_start": 30, "green_end": 0}
+    ],
+    "pairs": [{"first": 0, "second": 1, "clearance": 5}]
+  }'
+```
+
+响应：
+
+```json
+[{"first":0,"second":1,"clearance":5,
+  "danger_intervals":[{"start":0,"end":5},{"start":30,"end":35},
+                      {"start":60,"end":65},{"start":90,"end":95}]}]
+```
+
+清空间隔为 0 时，半开绿灯在端点 30 处恰好交接、互不重叠，该对安全，返回
+`"danger_intervals":[]`。
+
+### 示例 2：同时绿灯为危险；两股都红的尾部重叠不危险
+
+车流 0 绿灯 `[0,10)`、车流 1 绿灯 `[20,30)`，清空间隔 30 秒。车流 1 的整段绿灯
+距车流 0 结束仅 10～20 秒（不足 30），故 `[20,30)` 全部危险；但 `t∈[30,40)` 时
+两股都已变红——尽管 30 秒的清空尾部在该段相互重叠——并不计入：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "audit_from": 0,
+    "audit_to": 60,
+    "streams": [
+      {"cycle": 60, "offset": 0, "green_start": 0,  "green_end": 10},
+      {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 30}
+    ],
+    "pairs": [{"first": 0, "second": 1, "clearance": 30}]
+  }'
+# [{"first":0,"second":1,"clearance":30,
+#   "danger_intervals":[{"start":20,"end":30}]}]
+```
+
+### 示例 3：计入范围起点之前结束的绿灯
+
+车流 0 周期 200 秒、绿灯 `[0,100)`，车流 1 绿灯 `[105,120)`，审计范围从 100
+秒开始。车流 0 的绿灯恰在范围起点（不含）结束，但清空间隔为 10 秒时其尾部伸入
+范围：车流 1 绿灯开始的 105～109 秒仍距车流 0 结束不足 10 秒，判为危险；
+`clearance=5` 时恰为 5 秒（"不足 5 秒"不成立），该对安全：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "audit_from": 100,
+    "audit_to": 200,
+    "streams": [
+      {"cycle": 200, "offset": 0, "green_start": 0,   "green_end": 100},
+      {"cycle": 200, "offset": 0, "green_start": 105, "green_end": 120}
+    ],
+    "pairs": [{"first": 0, "second": 1, "clearance": 10}]
+  }'
+# [{"first":0,"second":1,"clearance":10,
+#   "danger_intervals":[{"start":105,"end":110}]}]
+```
+
+### 冲突审计的算法说明（周期展开 + 双向延长求交，不逐秒试探）
+
+1. **周期展开绿灯**：对每股车流，把本地绿灯分量（跨零点先视为一条连续段，常绿为
+   整周期）按周期映射为绝对时间半开区间 `[kC + a - offset, kC + b - offset)`，由
+   整除直接算出与审计范围（向起点前多回溯至多 300 秒清空间隔）有交的周期 k 枚举
+   范围；跨零点展开出的两段在周期边界端点相接，合并为连续区间；
+2. **双向延长尾部**：把每股绿灯尾部向右延长 d 秒得到
+   `E = ⋃[a, b+d)`。危险集合恰为 `(G_i ∩ E_j) ∪ (E_i ∩ G_j)`：前者覆盖"i 绿且
+   j 同时绿或结束不足 d 秒"，后者覆盖对称情形；两者都只要求**至少一股为绿灯**，
+   故两车尾段（两股都红）的相交天然被排除；
+3. 区间双指针求交后裁剪进 `[audit_from, audit_to)` 并合并重叠 / 端点相接段，即得
+   全部极大半开危险区间，按起点升序输出；安全的车流对为空数组。
+
+每对车流只做常数次线性区间扫描，复杂度约为
+`O(对数 × (范围长度 / 最小周期))`；全天 86400 秒、最小周期 1 秒的极端情形每对也仅
+约 17 万个区间，测试另含性能用例。测试含 1700 组随机参数下与逐秒判定暴力参考实现
+（完整检查三条危险规则，逐秒回溯清空间隔）的逐项对照。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -1540,6 +1697,23 @@ deadline 合法但绿灯容量不足（含范围内全程红灯）属于业务�
 { "detail": ["arrivals[0].deadline = 60 必须满足 time <= deadline < forecast_to（范围终点 60 不含）"] }
 ```
 
+`/api/green-wave/conflict-audit` 的 422 校验：
+
+- `streams` 数量在 **2..8**（字段级 422），每股 `cycle ∈ [1, 86400]`（字段级 422），
+  且 `0 <= offset / green_start / green_end < cycle`（跨字段 422，错误信息带车流下标）；
+- `audit_to > audit_from` 且审计范围长度不超过 **86400 秒**（跨字段 422）；
+- `pairs` 不超过 **28** 对、`clearance ∈ [0, 300]`、`first / second >= 0`
+  （字段级 422）；
+- 每对的 `first` 与 `second` 必须**小于车流数且互不相同**，同一对车流不得重复
+  （`(1,0)` 与 `(0,1)` 视为同一对）——均为跨字段 422，错误信息带对下标。
+
+不存在危险区间属于业务结果而非请求错误：安全的车流对在 200 响应中返回
+`"danger_intervals": []`，不会返回 422。
+
+```json
+{ "detail": ["pairs[1] 车流对 (0, 1) 重复：同一对互斥车流只能出现一次（顺序相反也视为重复）"] }
+```
+
 ## 算法说明（区间运算，不逐秒试探）
 
 1. **周期内展开与波动收缩**：每个路口的绿灯半开区间先展开为连续分量
@@ -1591,6 +1765,13 @@ deadline 合法但绿灯容量不足（含范围内全程红灯）属于业务�
 `null`；复杂度 `O(log(车辆总数) × (范围秒数 + 批次数))`，模拟本身与车辆总数大小
 无关。
 
+`/api/green-wave/conflict-audit` 不做逐秒试探：先把每股周期绿灯（跨零点先连续化、
+常绿占满整周期）展开为绝对时间半开区间（枚举下界向审计范围起点前回溯至多 300 秒
+清空间隔，以纳入尾部伸入范围的起点之前绿灯），再把绿灯尾部右延 d 秒，双向求
+`(G_i ∩ E_j) ∪ (E_i ∩ G_j)`——只与对方绿灯求交，两股都红的车尾段重叠不计入——
+裁剪进审计范围并合并为极大半开区间；复杂度约为
+`O(对数 × (范围长度 / 最小周期))` 次区间运算。
+
 ## 运行测试
 
 ```bash
@@ -1630,4 +1811,9 @@ pytest -q
 通过秒）的逐项对照，并覆盖 deadline 含端点、红灯容量不足无解、同秒批次按输入
 顺序共享绿灯容量、期初队列阻挡、跨零点绿灯与 offset 相位、范围终点不含、无车辆
 返回放行量 1、超大车辆数（不逐辆展开）及 `deadline` 早于到达秒或不小于范围
-终点等 422 校验场景。
+终点等 422 校验场景；冲突车流安全间隔审计
+另有 1700 组随机参数下与逐秒判定暴力参考实现（同时绿灯、双向各回溯清空间隔检查
+尾部）的逐项对照，并覆盖清空间隔端点（恰为 d 秒不危险）、两股都红的尾部重叠不
+计入、范围起点之前绿灯的尾部伸入、跨零点绿灯合并、常绿、offset 相位、不同周期、
+多对车流与不同清空间隔并存、全天 86400 秒范围性能，以及车流数、车流对下标 /
+重复对、清空间隔与范围长度等 422 校验场景。

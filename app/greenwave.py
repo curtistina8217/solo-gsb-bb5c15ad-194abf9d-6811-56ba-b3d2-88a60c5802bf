@@ -163,6 +163,31 @@ headway），故采用动态规划：正向 ``f_j(t) = |t-o_j| + min f_{j-1}(s)`
 清空且下一次到达之前不可能有任何批次到期（deadline 不早于自身到达秒），
 故可直接跳到下一到达秒。无解（含范围内绿灯秒不足以清空、某批 deadline
 无法满足）返回 ``None``。
+
+冲突车流安全间隔审计
+--------------------
+:func:`compute_conflict_audit` 在给定半开审计范围
+``[audit_from, audit_to)``（最长 86400 秒）内，对 2..8 股周期信号中的若干
+互斥车流对逐对给出全部极大半开**危险区间**。每股车流沿用统一的信号语义
+（cycle / offset / green_start / green_end，半开绿灯、跨零点与整周期常绿）。
+对车流对 (i, j) 与清空间隔 d（0..300 秒），时刻 t 危险当且仅当：
+
+* 两股车流在 t **同时绿灯**；
+* i 在 t 仍为绿灯、而 j 的绿灯在 t 之前**不足 d 秒**结束（j 方向尚在清空）；
+* 对称地，j 在 t 仍为绿灯、而 i 的绿灯结束不足 d 秒。
+
+两股都已不是绿灯（车尾清空时段相互重叠）并不危险。把每股周期绿灯展开为
+绝对时间半开区间 ``[a,b)``，再把尾部向右延长 d 秒得到
+``E = ⋃[a, b+d)``，则危险集合恰为
+
+    (G_i ∩ E_j) ∪ (E_i ∩ G_j)，
+
+即"双向"各做一次延长与求交：``G_i ∩ E_j`` 覆盖 i 绿 / j 刚结束（含同时
+绿），``E_i ∩ G_j`` 覆盖 j 绿 / i 刚结束（含同时绿），而两车尾段的相交
+``T_i ∩ T_j`` 天然不计入。展开时须计入**审计范围起点之前**的绿灯区间
+（其延长尾部可能伸入范围）与**跨零点**区间（跨零点绿灯先连续化，端点相接
+的周期展开由合并处理）。全程只做区间枚举、延长、求交与合并，不逐秒试探；
+安全的车流对危险区间为空数组。
 """
 
 from __future__ import annotations
@@ -182,6 +207,8 @@ MAX_ROUTE_INTERSECTIONS = 30
 MAX_ROADS = 120
 MAX_QUEUE_FORECAST_SECONDS = 86_400
 MAX_ARRIVAL_BATCHES = 1_000
+MAX_CONFLICT_STREAMS = 8
+MAX_CONFLICT_CLEARANCE = 300
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -1501,3 +1528,109 @@ def compute_min_discharge(
     )
     # feasible(total_vehicles) 已通过且 lo 为二分得到的可行值，结果必非 None。
     return lo, pass_times  # type: ignore[return-value]
+
+
+# ---------- 冲突车流安全间隔审计（conflict audit） ----------
+
+
+def absolute_green_intervals(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    lo: int,
+    hi: int,
+) -> list[Interval]:
+    """展开绝对时间轴上与半开范围 [lo, hi) 相交的全部绿灯半开区间。
+
+    相位、半开绿灯、跨零点（先视为连续段）与整周期常绿语义与
+    :func:`departure_windows_for_intersection` 完全一致，但不做任何裁剪：
+    跨零点绿灯在周期边界处端点相接（``[kC+Cg, (k+1)C)`` 与
+    ``[(k+1)C, (k+1)C+ge)``），常绿同理，合并后成为连续区间。这里没有
+    行驶时间，shift 即 ``offset`` 自身（本地相位为 ``(t + offset) mod C``）。
+
+    只枚举与 [lo, hi) 有非空交的周期分量 k：
+    ``kC + b - offset > lo`` 且 ``kC + a - offset < hi``。
+    """
+    shift = offset
+    raw: list[Interval] = []
+    for local_start, local_end in local_green_intervals(cycle, green_start, green_end):
+        k_min = (lo - local_end + shift) // cycle + 1
+        k_max = -((-(hi - local_start + shift)) // cycle) - 1
+        for k in range(k_min, k_max + 1):
+            base = k * cycle
+            raw.append(
+                [base + local_start - shift, base + local_end - shift]
+            )
+    return merge_intervals(raw)
+
+
+def compute_conflict_audit(
+    streams: list[dict],
+    pairs: list[tuple[int, int, int]],
+    audit_from: int,
+    audit_to: int,
+) -> list[list[Interval]]:
+    """逐对审计互斥车流的安全间隔，返回每对车流的全部极大半开危险区间。
+
+    ``streams`` 按下标给出 2..8 股车流各自的 cycle / offset / green_start /
+    green_end（相位、半开绿灯、跨零点与常绿语义与其余接口完全一致）；
+    ``pairs`` 为 ``(第一股下标, 第二股下标, 清空间隔)`` 三元组序列，清空间隔
+    d 满足 0 <= d <= 300（下标合法性由请求侧 422 保证）；审计范围为半开
+    区间 ``[audit_from, audit_to)``。
+
+    返回与 ``pairs`` 同序的列表，每项为该股车流对在审计范围内的全部极大半开
+    危险区间（按起点升序）。时刻 t 危险当且仅当：两股同时绿灯；或一股仍为
+    绿灯而另一股绿灯结束尚不足 d 秒。令绿灯集合为 G、尾部右延 d 秒的集合为
+    E = ⋃[a, b+d)，危险集合恰为 ``(G_i ∩ E_j) ∪ (E_i ∩ G_j)``——两车尾段
+    相交（两股都已变红）不计入。展开时纳入起点之前的绿灯（尾部伸入范围）与
+    跨零点区间；全程只做区间枚举、延长、求交与合并，不逐秒试探；安全的车流
+    对返回空数组。
+    """
+    max_clearance = max((pair[2] for pair in pairs), default=0)
+    # 枚举下界须覆盖"尾部伸入审计范围"的起点之前绿灯：绿灯起点 < audit_from
+    # 即可能因延长与范围相交，故回溯 max_clearance 秒已足够（a >= b-d-... 的
+    # 补集：a + d < audit_from 的区间不可能与范围相交）。
+    enumerate_from = audit_from - max_clearance
+
+    greens: list[list[Interval]] = []
+    extended: list[list[Interval]] = []
+    for stream in streams:
+        intervals = absolute_green_intervals(
+            cycle=stream["cycle"],
+            offset=stream["offset"],
+            green_start=stream["green_start"],
+            green_end=stream["green_end"],
+            lo=enumerate_from,
+            hi=audit_to,
+        )
+        greens.append(intervals)
+        if max_clearance:
+            extended.append(
+                merge_intervals(
+                    [[start, end + max_clearance] for start, end in intervals]
+                )
+            )
+        else:
+            extended.append(intervals)
+
+    results: list[list[Interval]] = []
+    for first, second, clearance in pairs:
+        green_first, green_second = greens[first], greens[second]
+        if clearance == max_clearance:
+            ext_first, ext_second = extended[first], extended[second]
+        else:
+            # 该对清空间隔小于全局最大值时按自身 d 重新延长（枚举下界已足够）。
+            ext_first = merge_intervals(
+                [[start, end + clearance] for start, end in green_first]
+            )
+            ext_second = merge_intervals(
+                [[start, end + clearance] for start, end in green_second]
+            )
+        # 双向各一次"绿灯 ∩ 对方延长尾部"：i 绿且 j 结束不足 d 秒（含同时
+        # 绿），与 j 绿且 i 结束不足 d 秒（含同时绿）；两车尾段相交被排除。
+        danger = intersect_interval_lists(green_first, ext_second)
+        danger.extend(intersect_interval_lists(ext_first, green_second))
+        clipped = clip_intervals(danger, audit_from, audit_to)
+        results.append(merge_intervals(clipped))
+    return results

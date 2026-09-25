@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .greenwave import (
+    compute_conflict_audit,
     compute_convoy_starts,
     compute_earliest_route,
     compute_max_coverage,
@@ -17,6 +18,8 @@ from .greenwave import (
     offset_diagnostics,
 )
 from .schemas import (
+    ConflictAuditRequest,
+    ConflictPairResult,
     ConvoyStartsRequest,
     EarliestRouteRequest,
     EarliestRouteResponse,
@@ -102,9 +105,16 @@ app = FastAPI(
         "放行，跨零点与常绿判灯规则不变）与对放行量的单调二分，求使期初"
         "车辆及全部批次在范围结束前清空、且每批最后一辆不晚于自身 deadline"
         "的最小正整数每绿灯秒放行量；同秒批次按输入顺序先入队再放行。返回"
-        "最低放行量及该值下按输入顺序的各批通过秒，无解返回 null。"
+        "最低放行量及该值下按输入顺序的各批通过秒，无解返回 null。\n\n"
+        "冲突车流安全间隔审计接口 `POST /api/green-wave/conflict-audit`：给定 "
+        "2..8 股车流的周期、offset 与绿灯半开区间（相位、跨零点与常绿语义同"
+        "上）、最长 86400 秒的半开审计范围，以及若干互斥车流对与各对 0..300 "
+        "秒的清空间隔。对每对车流，两股同时绿灯，或一股仍为绿灯而另一股绿灯"
+        "结束尚不足清空间隔时，均判为危险；按周期展开绿灯区间（计入范围起点"
+        "之前的绿灯与跨零点区间），双向延长尾部后求交，逐对返回按时间升序"
+        "合并的全部极大半开危险区间；安全的车流对返回空数组。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -396,3 +406,46 @@ def green_wave_min_discharge(
         min_discharge_per_second=discharge,
         batch_pass_times=pass_times,
     )
+
+
+@app.post(
+    "/api/green-wave/conflict-audit",
+    response_model=list[ConflictPairResult],
+    tags=["绿波"],
+    summary="互斥车流安全间隔审计：逐对返回全部极大半开危险区间",
+)
+def green_wave_conflict_audit(
+    request: ConflictAuditRequest,
+) -> list[ConflictPairResult]:
+    request.validate_ranges()
+    results = compute_conflict_audit(
+        streams=[
+            {
+                "cycle": stream.cycle,
+                "offset": stream.offset,
+                "green_start": stream.green_start,
+                "green_end": stream.green_end,
+            }
+            for stream in request.streams
+        ],
+        pairs=[
+            (pair.first, pair.second, pair.clearance) for pair in request.pairs
+        ],
+        audit_from=request.audit_from,
+        audit_to=request.audit_to,
+    )
+    payload: list[ConflictPairResult] = []
+    for pair, intervals in zip(request.pairs, results):
+        # 统一按 (小下标, 大下标) 规范化输出，与输入方向无关。
+        lo_index, hi_index = sorted((pair.first, pair.second))
+        payload.append(
+            ConflictPairResult(
+                first=lo_index,
+                second=hi_index,
+                clearance=pair.clearance,
+                danger_intervals=[
+                    Window(start=start, end=end) for start, end in intervals
+                ],
+            )
+        )
+    return payload
